@@ -51,6 +51,7 @@
 -define(GEN_STATEM_OPTS, []).  % Use e.g. [{debug, [trace]}] for debugging
 
 -record(data, { role                   :: role()
+              , channel_status         :: undefined | open
               , state = []             :: [aetx_sign:signed_tx()]
               , session                :: pid()
               , client                 :: pid()
@@ -60,6 +61,12 @@
               , create_tx              :: undefined | any()
               , latest = undefined     :: undefined | any()
               }).
+
+-define(TRANSITION_STATE(S),  S=:=awaiting_signature
+                            ; S=:=awaiting_open
+                            ; S=:=awaiting_locked
+                            ; S=:=awaiting_update_ack
+                            ; S=:=closing ).
 
 callback_mode() -> [state_functions, state_enter].
 
@@ -173,15 +180,16 @@ timer_subst(closing                ) -> accept.
 
 default_timeouts() ->
     #{ open           => 120000
-     , accept         => 2000
-     , funding_create => 2000
-     , funding_sign   => 2000
-     , funding_lock   => 30000
-     , idle           => 60000
-     , sign           => 5000
+     , accept         => 120000
+     , funding_create => 120000
+     , funding_sign   => 120000
+     , funding_lock   => 360000
+     , idle           => 600000
+     , sign           => 500000
      }.
 
-%%
+%% ======================================================================
+%% API
 %% ======================================================================
 
 initiate(Host, Port, #{} = Opts0) ->
@@ -211,13 +219,17 @@ start_link(#{} = Arg) ->
     gen_statem:start_link(?MODULE, Arg, ?GEN_STATEM_OPTS).
 
 
+%% ======================================================================
+%% FSM initialization
+
 init(#{role := Role} = Arg) ->
     #{client := Client} = Opts0 = maps:get(opts, Arg, #{}),
     DefMinDepth = default_minimum_depth(Role),
     Opts = check_opts(
              [
               fun(O) -> check_minimum_depth_opt(DefMinDepth, Role, O) end,
-              fun check_timeout_opt/1
+              fun check_timeout_opt/1,
+              fun check_rpt_opt/1
              ], Opts0),
     Session = start_session(Arg, Opts),
     Data = #data{role    = Role,
@@ -257,6 +269,28 @@ check_timeout_opt(Opts) ->
     lager:debug("Timeouts: ~p", [Res]),
     Res.
 
+check_rpt_opt(Opts) ->
+    ROpts = case maps:find(report, Opts) of
+                {ok, R} when is_map(R) ->
+                    L = [{K,V} || {K,V} <- maps:to_list(R),
+                                  lists:member(K, [info, state, error])
+                                      andalso
+                                      is_boolean(V)],
+                    maps:to_list(L);
+                error ->
+                    case maps:find(report_info, Opts) of  %% bw compatibility
+                        {ok, V} when is_boolean(V) ->
+                            #{info => V};
+                        _ ->
+                            #{}
+                    end;
+                Other ->
+                    lager:error("Unknown report opts: ~p", [Other]),
+                    #{}
+          end,
+    lager:debug("Report opts = ~p", [ROpts]),
+    Opts#{report => ROpts}.
+
 %% As per CHANNELS.md, the responder is regarded as the one typically
 %% providing the service, and the initiator connects.
 start_session(#{role := responder, port := Port}, Opts) ->
@@ -268,12 +302,16 @@ start_session(#{role := initiator, host := Host, port := Port}, Opts) ->
 
 ok({ok, X}) -> X.
 
+
+%% ======================================================================
+%% FSM states
+
 awaiting_open(enter, _OldSt, D) ->
     {keep_state, D, [timer_for_state(awaiting_open, D)]};
 awaiting_open(cast, {channel_open, Msg}, #data{role = responder} = D) ->
     case check_open_msg(Msg, D) of
         {ok, D1} ->
-            report_info(channel_open, D1),
+            report(info, channel_open, D1),
             gproc_register(D1),
             {next_state, accepted, send_channel_accept(D1)};
         {error, _} = Error ->
@@ -290,7 +328,7 @@ initialized(cast, {channel_accept, Msg}, #data{role = initiator} = D) ->
     case check_accept_msg(Msg, D) of
         {ok, D1} ->
             gproc_register(D1),
-            report_info(channel_accept, D1),
+            report(info, channel_accept, D1),
             {ok, CTx} = create_tx_for_signing(D1),
             ok = request_signing(create_tx, CTx, D1),
             D2 = D1#data{latest = {sign, create_tx, CTx}},
@@ -354,7 +392,7 @@ accepted(enter, _OldSt, D) ->
 accepted(cast, {funding_created, Msg}, #data{role = responder} = D) ->
     case check_funding_created_msg(Msg, D) of
         {ok, SignedTx, D1} ->
-            report_info(funding_created, D1),
+            report(info, funding_created, D1),
             lager:debug("funding_created: ~p", [SignedTx]),
             ok = request_signing(funding_created, aetx_sign:tx(SignedTx), D1),
             D2 = D1#data{latest = {sign, funding_created, SignedTx}},
@@ -375,7 +413,7 @@ half_signed(enter, _OldSt, D) ->
 half_signed(cast, {funding_signed, Msg}, #data{role = initiator} = D) ->
     case check_funding_signed_msg(Msg, D) of
         {ok, SignedTx, D1} ->
-            report_info(funding_signed, D1),
+            report(info, funding_signed, D1),
             ok = aec_tx_pool:push(SignedTx),
             D2 = D1#data{create_tx = SignedTx},
             {ok, Watcher, D3} = start_min_depth_watcher(D2),
@@ -394,7 +432,7 @@ half_signed({call, From}, Req, D) ->
 awaiting_locked(enter, _OldSt, D) ->
     {keep_state, D, [timer_for_state(awaiting_locked, D)]};
 awaiting_locked(cast, {own_funding_locked, ChainId}, D) ->
-    report_info(own_funding_locked, D),
+    report(info, own_funding_locked, D),
     {next_state, signed,
      send_funding_locked_msg(D#data{on_chain_id = ChainId,
                                     latest = undefined})};
@@ -412,7 +450,7 @@ awaiting_initial_state(cast, {update, Msg}, #data{role = responder} = D) ->
     case check_update_msg(fun check_initial_state/2, Msg, D) of
         {ok, SignedTx, D1} ->
             lager:debug("update_msg checks out", []),
-            report_info(update, D1),
+            report(info, update, D1),
             ok = request_signing(update_ack, aetx_sign:tx(SignedTx), D1),
             D2 = D1#data{latest = {sign, update_ack, SignedTx}},
             {next_state, awaiting_signature, D2};
@@ -431,7 +469,7 @@ awaiting_initial_state(Evt, Msg, D) ->
 
 awaiting_update_ack(enter, _OldSt, D) ->
     {keep_state, D, [timer_for_state(awaiting_update_ack, D)]};
-awaiting_update_ack(cast, {update_ack, Msg}, #data{role = initiator} = D) ->
+awaiting_update_ack(cast, {update_ack, Msg}, #data{} = D) ->
     case check_update_ack_msg(Msg, D) of
         {ok, D1} ->
             {next_state, open, D1};
@@ -450,7 +488,7 @@ signed(enter, _OldSt, D) ->
 signed(cast, {funding_locked, Msg}, D) ->
     case check_funding_locked_msg(Msg, D) of
         {ok, D1} ->
-            report_info(funding_locked, D1),
+            report(info, funding_locked, D1),
             funding_locked_complete(D1);
         {error, _} = Error ->
             close(Error, D)
@@ -479,12 +517,17 @@ funding_locked_complete(D) ->
 
 
 open(enter, _OldSt, D) ->
-    report_info(open, D),
-    {keep_state, D, [timer_for_state(open, D)]};
+    D1 = if D#data.channel_status =/= open ->
+                 report(info, open, D),
+                 D#data{channel_status = open};
+            true ->
+                 D
+         end,
+    {keep_state, D1, [timer_for_state(open, D)]};
 open(cast, {update, Msg}, D) ->
     case check_update_msg(none, Msg, D) of
         {ok, SignedTx, D1} ->
-            report_info(update, D1),
+            report(info, update, D1),
             ok = request_signing(update_ack, aetx_sign:tx(SignedTx), D1),
             D2 = D1#data{latest = {sign, update_ack, SignedTx}},
             {next_state, awaiting_signature, D2};
@@ -526,6 +569,9 @@ closing(cast, {closing_signed, _Msg}, D) ->
 disconnected(cast, {channel_reestablish, _Msg}, D) ->
     {next_state, closing, D}.
 
+close(close_mutual, D) ->
+    report(info, close_mutual, D),
+    {stop, normal, D};
 close(Reason, D) ->
     try send_error_msg(Reason, D)
     catch error:_ -> ignore
@@ -538,8 +584,10 @@ send_error_msg(Reason, #data{session = Sn} = D) ->
         ChId ->
             case Reason of
                 {error, E} ->
+                    Eb = error_binary(E),
                     Msg = #{ channel_id => ChId
-                           , data       => error_binary(E) },
+                           , data       => Eb },
+                    report(error, Eb, D),
                     aesc_session_noise:error(Sn, Msg);
                 _ ->
                     no_msg
@@ -572,6 +620,8 @@ handle_call_(open, shutdown, From, #data{state = State} = D) ->
             {keep_state, D, [{reply, From, {error, E}},
                              timer_for_state(open, D)]}
     end;
+handle_call_(St, _Req, _From, _D) when ?TRANSITION_STATE(St) ->
+    {keep_state_and_data, [postpone]};
 handle_call_(St, _Req, From, D) ->
     {keep_state, D, [{reply, From, {error, unknown_request}},
                      timer_for_state(St, D)]}.
@@ -827,9 +877,9 @@ check_update_msg_(F, #{ channel_id := ChanId
             {error, {deserialize, E}}
     end.
 
-check_signed_update_tx(F, SignedTx, #data{state = State} = D) ->
+check_signed_update_tx(F, SignedTx, #data{state = State, opts = Opts} = D) ->
     lager:debug("check_signed_update_tx(~p)", [SignedTx]),
-    case check_update_tx(F, SignedTx, State) of
+    case check_update_tx(F, SignedTx, State, Opts) of
         ok ->
             {ok, SignedTx, D};
         {error, _} = Error ->
@@ -876,11 +926,12 @@ check_update_ack_(SignedTx, HalfSignedTx) ->
     lager:debug("Txes are the same", []),
     ok.
 
-handle_upd_transfer(FromPub, ToPub, Amount, From, #data{state = State} = D) ->
+handle_upd_transfer(FromPub, ToPub, Amount, From, #data{ state = State
+                                                       , opts = Opts } = D) ->
     {Round, SignedTx} = get_latest_state_tx(State),
     Tx = aetx_sign:tx(SignedTx),
     Updates = [{FromPub, ToPub, Amount}],
-    try  Tx1 = apply_updates(Updates, Tx),
+    try  Tx1 = apply_updates(Updates, Tx, Opts),
          Tx2 = set_tx_values([{round         , Round+1},
                               {previous_round, Round},
                               {updates       , Updates}], Tx1),
@@ -970,14 +1021,14 @@ clean_state([SignedTx|T]) ->
         []    -> clean_state(T)
     end.
 
-check_update_tx(F, SignedTx, State) ->
+check_update_tx(F, SignedTx, State, Opts) ->
     lager:debug("check_update_tx(State = ~p)", [State]),
     Tx = aetx_sign:tx(SignedTx),
     lager:debug("Tx = ~p", [Tx]),
     case tx_previous_round(Tx) of
         0 when State == [] ->
             lager:debug("previous round = 0", []),
-            check_update_tx_(F, Tx, SignedTx);
+            check_update_tx_(F, Tx, SignedTx, Opts);
         PrevRound ->
             lager:debug("PrevRound = ~p", [PrevRound]),
             {LastRound, LastSignedTx} = get_latest_state_tx(State),
@@ -985,15 +1036,15 @@ check_update_tx(F, SignedTx, State) ->
             case PrevRound == LastRound of
                 true ->
                     lager:debug("PrevRound == LastRound", []),
-                    check_update_tx_(F, Tx, LastSignedTx);
+                    check_update_tx_(F, Tx, LastSignedTx, Opts);
                 false -> {error, invalid_previous_round}
             end
     end.
 
-check_update_tx_(F, Tx, SignedTx) ->
+check_update_tx_(F, Tx, SignedTx, Opts) ->
     LastTx = aetx_sign:tx(SignedTx),
     Updates = tx_updates(Tx),
-    try  CheckTx = apply_updates(Updates, LastTx),
+    try  CheckTx = apply_updates(Updates, LastTx, Opts),
          case {{tx_initiator_amount(CheckTx), tx_responder_amount(CheckTx)},
                {tx_initiator_amount(Tx)     , tx_responder_amount(Tx)}} of
              {X, X} ->
@@ -1038,13 +1089,14 @@ set_tx_values_([{K, V}|T], Mod, Tx) ->
 set_tx_values_([], _, Tx) ->
     Tx.
 
-apply_updates([], Tx) ->
+apply_updates([], Tx, _Opts) ->
     Tx;
-apply_updates([{From, To, Amount}|Ds], Tx) ->
+apply_updates([{From, To, Amount}|Ds], Tx, Opts) ->
     Initiator = tx_initiator(Tx),
     Responder = tx_responder(Tx),
     IAmt = tx_initiator_amount(Tx),
     RAmt = tx_responder_amount(Tx),
+    Reserve = maps:get(channel_reserve, Opts, 0),
     {FA, FB, A, B} =
         case {From, To} of
             {Initiator, Responder} ->
@@ -1056,14 +1108,14 @@ apply_updates([{From, To, Amount}|Ds], Tx) ->
                 error(unknown_pubkeys)
         end,
     {A1, B1} = {A - Amount, B + Amount},
-    Tx1 = if A1 < 0 ->
+    Tx1 = if A1 < Reserve ->
                   %% TODO: consider minimum balance
                   error(insufficient_balance);
              true ->
                   set_tx_values([{FA, A1},
                                  {FB, B1}], Tx)
           end,
-    apply_updates(Ds, Tx1).
+    apply_updates(Ds, Tx1, Opts).
 
 run_extra_checks(none, _) -> ok;
 run_extra_checks(F, Tx) when is_function(F, 2) ->
@@ -1155,9 +1207,17 @@ gproc_name(Id, Role) ->
 evt(_Msg) ->
     ok.
 
-report_info(St, #data{client = Client, channel_id = ChanId,
-                       opts = #{report_info := DoRpt}}) ->
-    lager:debug("report_info(~p, ~p, ~p)", [DoRpt, ChanId, St]),
-    if DoRpt -> Client ! {?MODULE, self(), ChanId, {info, St}};
+report(Tag, St, D) -> report_info(do_rpt(Tag, D), Tag, St, D).
+
+report_info(DoRpt, Tag, St, #data{client = Client, channel_id = ChanId}) ->
+    lager:debug("report_info(~p, ~p, ~p, ~p)", [DoRpt, Tag, ChanId, St]),
+    if DoRpt -> Client ! {?MODULE, self(), ChanId, {Tag, St}};
        true  -> ok
+    end.
+
+do_rpt(Tag, #data{opts = #{report := Rpt}}) ->
+    try maps:get(Tag, Rpt, false)
+    catch
+        error:_ ->
+            false
     end.

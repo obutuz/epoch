@@ -174,7 +174,7 @@ await_funding_signed_i(I, R) ->
 
 await_funding_locked(I, R) ->
     ct:log("mining blocks on dev1 for minimum depth", []),
-    aecore_suite_utils:mine_blocks(aecore_suite_utils:node_name(dev1), 4),
+    aecore_suite_utils:mine_blocks(aecore_suite_utils:node_name(dev1), 5),
     await_initial_state(I, R).
 
 await_initial_state(I, R) ->

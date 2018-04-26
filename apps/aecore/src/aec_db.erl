@@ -74,6 +74,7 @@
 
 -include("common.hrl").
 -include("blocks.hrl").
+-include("aec_db.hrl").
 
 %% - transactions
 %% - headers
@@ -85,19 +86,6 @@
 %% - name_service_state
 %% - name_service_cache
 %% - one per state tree
-
--record(aec_blocks             , {key, txs}).
--record(aec_headers            , {key, value, has_block = false, height}).
--record(aec_contract_state     , {key, value}).
--record(aec_tx                 , {key, tx}).
--record(aec_chain_state        , {key, value}).
--record(aec_block_state        , {key, value, difficulty}).
--record(aec_oracle_cache       , {key, value}).
--record(aec_oracle_state       , {key, value}).
--record(aec_account_state      , {key, value}).
--record(aec_channel_state      , {key, value}).
--record(aec_name_service_cache , {key, value}).
--record(aec_name_service_state , {key, value}).
 
 -define(TAB(Record), {Record, set(Mode, record_info(fields, Record))}).
 -define(TAB(Rec, Extra), {Rec, set(Mode, record_info(fields, Rec), Extra)}).
@@ -502,9 +490,14 @@ check_db() ->
 
 initialize_db(Mode) ->
     add_backend_plugins(Mode),
+    run_hooks('$aec_db_add_plugins', Mode),
     add_index_plugins(),
+    run_hooks('$aec_db_add_index_plugins', Mode),
     ensure_mnesia_tables(Mode),
     ok.
+
+run_hooks(Hook, Mode) ->
+    [M:F(Mode) || {_App, {M,F}} <- setup:find_env_vars(Hook)].
 
 
 add_backend_plugins(disc) ->
@@ -520,6 +513,7 @@ ensure_mnesia_tables(Mode) ->
     [{atomic,ok} = mnesia:create_table(T, Spec)
      || {T, Spec} <- tables(Mode),
         not lists:member(T, Tabs)],
+    run_hooks('$aec_db_create_tables', Mode),
     ok.
 
 
