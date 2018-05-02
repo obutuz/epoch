@@ -7,6 +7,7 @@
 -export([initiate/3,     %% (host(), port(), Opts :: #{})
          respond/2,      %% (port(), Opts :: #{})
          upd_transfer/4, %% (fsm() , from(), to(), amount())
+         inband_msg/3,
          shutdown/1]).   %% (fsm())
 
 %% Used by noise session
@@ -52,6 +53,7 @@
 
 -record(data, { role                   :: role()
               , channel_status         :: undefined | open
+              , cur_statem_state       :: undefined | atom()
               , state = []             :: [aetx_sign:signed_tx()]
               , session                :: pid()
               , client                 :: pid()
@@ -158,6 +160,9 @@ timer(Name, Msg, #data{opts = #{timeouts := TOs}}) ->
 timeout_(Timeout, Msg) when is_integer(Timeout); Timeout == infinity ->
     {timeout, Timeout, Msg}.
 
+timer_for_state(#data{cur_statem_state = St} = D) when St =/= undefined ->
+    timer_for_state(St, D).
+
 timer_for_state(St, #data{opts = #{timeouts := TOs}} = D) ->
     case maps:find(St, TOs) of
         {ok, T} -> timeout_(T, St);
@@ -210,6 +215,10 @@ respond(Port, #{} = Opts0) ->
 upd_transfer(Fsm, From, To, Amount) ->
     lager:debug("upd_transfer(~p, ~p, ~p, ~p)", [Fsm, From, To, Amount]),
     gen_statem:call(Fsm, {upd_transfer, From, To, Amount}).
+
+inband_msg(Fsm, To, Msg) ->
+    lager:debug("inband_msg(~p, ~p, ~p)", [Fsm, To, Msg]),
+    gen_statem:call(Fsm, {inband_msg, To, Msg}).
 
 shutdown(Fsm) ->
     lager:debug("shutdown(~p)", [Fsm]),
@@ -304,16 +313,35 @@ ok({ok, X}) -> X.
 
 
 %% ======================================================================
+%% FSM transitions
+
+%% We set timers here to ensure that they are always set.
+%% gen_statem cancels event timers each time an event arrives
+%%
+next_state(St, D) -> next_state(St, D, []).
+next_state(St, D, Opts) ->
+    {next_state, St, cur_st(St, D), [timer_for_state(St, D)|Opts]}.
+
+keep_state(D) -> keep_state(D, []).
+keep_state(D, Opts) ->
+    {keep_state, D, [timer_for_state(D)|Opts]}.
+
+postpone(D) ->
+    keep_state(D, [postpone]).
+
+cur_st(St, D) ->
+    D#data{cur_statem_state = St}.
+
+%% ======================================================================
 %% FSM states
 
-awaiting_open(enter, _OldSt, D) ->
-    {keep_state, D, [timer_for_state(awaiting_open, D)]};
+awaiting_open(enter, _OldSt, _D) -> keep_state_and_data;
 awaiting_open(cast, {channel_open, Msg}, #data{role = responder} = D) ->
     case check_open_msg(Msg, D) of
         {ok, D1} ->
             report(info, channel_open, D1),
             gproc_register(D1),
-            {next_state, accepted, send_channel_accept(D1)};
+            next_state(accepted, send_channel_accept(D1));
         {error, _} = Error ->
             close(Error, D)
     end;
@@ -322,8 +350,7 @@ awaiting_open(timeout, awaiting_open = T, D) ->
 awaiting_open(cast, {disconnect, _Msg}, D) ->
     close(disconnect, D).
 
-initialized(enter, _OldSt, D) ->
-    {keep_state, D, [timer_for_state(initialized, D)]};
+initialized(enter, _OldSt, _D) -> keep_state_and_data;
 initialized(cast, {channel_accept, Msg}, #data{role = initiator} = D) ->
     case check_accept_msg(Msg, D) of
         {ok, D1} ->
@@ -332,7 +359,7 @@ initialized(cast, {channel_accept, Msg}, #data{role = initiator} = D) ->
             {ok, CTx} = create_tx_for_signing(D1),
             ok = request_signing(create_tx, CTx, D1),
             D2 = D1#data{latest = {sign, create_tx, CTx}},
-            {next_state, awaiting_signature, D2};
+            next_state(awaiting_signature, D2);
         {error, _} = Error ->
             close(Error, D)
     end;
@@ -344,12 +371,11 @@ initialized({call, From}, Req, D) ->
     handle_call(initialized, Req, From, D).
 
 
-awaiting_signature(enter, _OldSt, D) ->
-    {keep_state, D, [timer_for_state(awaiting_signature, D)]};
+awaiting_signature(enter, _OldSt, _D) -> keep_state_and_data;
 awaiting_signature(cast, {signed, create_tx, Tx},
                    #data{role = initiator, latest = {sign, create_tx, _CTx}} = D) ->
-    {next_state, half_signed,
-     send_funding_created_msg(Tx, D#data{latest = undefined})};
+    next_state(half_signed,
+               send_funding_created_msg(Tx, D#data{latest = undefined}));
 awaiting_signature(cast, {signed, funding_created, SignedTx},
                    #data{role = responder,
                          latest = {sign, funding_created, HSCTx}} = D) ->
@@ -357,21 +383,26 @@ awaiting_signature(cast, {signed, funding_created, SignedTx},
                     HSCTx, aetx_sign:signatures(SignedTx)),
     D1 = send_funding_signed_msg(NewSignedTx, D#data{create_tx = NewSignedTx}),
     {ok, Watcher, D2} = start_min_depth_watcher(D1),
-    {next_state, awaiting_locked, D2#data{latest = {watcher, Watcher}}};
+    next_state(awaiting_locked, D2#data{latest = {watcher, Watcher}});
 awaiting_signature(cast, {signed, update, SignedTx}, D) ->
     D1 = send_update_msg(SignedTx, D#data{state = [SignedTx|D#data.state]}),
-    {next_state, awaiting_update_ack, D1#data{latest = undefined}};
+    next_state(awaiting_update_ack, D1#data{latest = undefined});
 awaiting_signature(cast, {signed, update_ack, SignedTx},
                    #data{latest = {sign, update_ack, OCTx}} = D) ->
     NewSignedTx = aetx_sign:add_signatures(
                     OCTx, aetx_sign:signatures(SignedTx)),
     D1 = send_update_ack_msg(NewSignedTx, D),
     D2 = D1#data{state = [NewSignedTx | clean_state(D1#data.state)]},
-    {next_state, open, D2};
+    next_state(open, D2);
+awaiting_signature(cast, {update, _Msg},
+                   #data{latest = {sign, Upd, _}} = D) when Upd==update;
+                                                            Upd==update_ack ->
+    D1 = send_update_err_msg(fallback_to_stable_state(D)),
+    next_state(open, D1);
 awaiting_signature(cast, {signed, shutdown, SignedTx}, D) ->
     D1 = send_shutdown_msg(SignedTx, D),
     D2 = D1#data{latest = {shutdown, SignedTx}},
-    {next_state, closing, D2};
+    next_state(closing, D2);
 awaiting_signature(cast, {signed, shutdown_ack, SignedTx},
                    #data{latest = {sign, shutdown_ack, CMTx}} = D) ->
     NewSignedTx = aetx_sign:add_signatures(
@@ -387,8 +418,7 @@ awaiting_signature({call, From}, Req, D) ->
     handle_call(awaiting_signature, Req, From, D).
 
 
-accepted(enter, _OldSt, D) ->
-    {keep_state, D, [timer_for_state(accepted, D)]};
+accepted(enter, _OldSt, _D) -> keep_state_and_data;
 accepted(cast, {funding_created, Msg}, #data{role = responder} = D) ->
     case check_funding_created_msg(Msg, D) of
         {ok, SignedTx, D1} ->
@@ -396,7 +426,7 @@ accepted(cast, {funding_created, Msg}, #data{role = responder} = D) ->
             lager:debug("funding_created: ~p", [SignedTx]),
             ok = request_signing(funding_created, aetx_sign:tx(SignedTx), D1),
             D2 = D1#data{latest = {sign, funding_created, SignedTx}},
-            {next_state, awaiting_signature, D2}
+            next_state(awaiting_signature, D2)
         %% {error, _} = Error ->
         %%     close(Error, D)
     end;
@@ -408,8 +438,7 @@ accepted({call, From}, Req, D) ->
     handle_call(accepted, Req, From, D).
 
 
-half_signed(enter, _OldSt, D) ->
-    {keep_state, D, [timer_for_state(half_signed, D)]};
+half_signed(enter, _OldSt, _D) -> keep_state_and_data;
 half_signed(cast, {funding_signed, Msg}, #data{role = initiator} = D) ->
     case check_funding_signed_msg(Msg, D) of
         {ok, SignedTx, D1} ->
@@ -417,7 +446,7 @@ half_signed(cast, {funding_signed, Msg}, #data{role = initiator} = D) ->
             ok = aec_tx_pool:push(SignedTx),
             D2 = D1#data{create_tx = SignedTx},
             {ok, Watcher, D3} = start_min_depth_watcher(D2),
-            {next_state, awaiting_locked, D3#data{latest = {watcher, Watcher}}}
+            next_state(awaiting_locked, D3#data{latest = {watcher, Watcher}})
         %% {error, _} = Error ->
         %%     close(Error, D)
     end;
@@ -429,22 +458,20 @@ half_signed({call, From}, Req, D) ->
     handle_call(half_signed, Req, From, D).
 
 
-awaiting_locked(enter, _OldSt, D) ->
-    {keep_state, D, [timer_for_state(awaiting_locked, D)]};
+awaiting_locked(enter, _OldSt, _D) -> keep_state_and_data;
 awaiting_locked(cast, {own_funding_locked, ChainId}, D) ->
     report(info, own_funding_locked, D),
-    {next_state, signed,
-     send_funding_locked_msg(D#data{on_chain_id = ChainId,
-                                    latest = undefined})};
-awaiting_locked(cast, {funding_locked, _Msg}, _D) ->
-    {keep_state_and_data, [postpone]};
+    next_state(
+      signed, send_funding_locked_msg(D#data{on_chain_id = ChainId,
+                                             latest = undefined}));
+awaiting_locked(cast, {funding_locked, _Msg}, D) ->
+    postpone(D);
 awaiting_locked(cast, {disconnect, _Msg}, D) ->
     close(disconnect, D);
 awaiting_locked(timeout, awaiting_locked = T, D) ->
     close({timeout, T}, D).
 
-awaiting_initial_state(enter, _OldSt, D) ->
-    {keep_state, D, [timer_for_state(awaiting_initial_state, D)]};
+awaiting_initial_state(enter, _OldSt, _D) -> keep_state_and_data;
 awaiting_initial_state(cast, {update, Msg}, #data{role = responder} = D) ->
     lager:debug("got {update, ~p}", [Msg]),
     case check_update_msg(fun check_initial_state/2, Msg, D) of
@@ -453,7 +480,7 @@ awaiting_initial_state(cast, {update, Msg}, #data{role = responder} = D) ->
             report(info, update, D1),
             ok = request_signing(update_ack, aetx_sign:tx(SignedTx), D1),
             D2 = D1#data{latest = {sign, update_ack, SignedTx}},
-            {next_state, awaiting_signature, D2};
+            next_state(awaiting_signature, D2);
         {error,_} = Error ->
             %% TODO: do we do a dispute challenge here?
             close(Error, D)
@@ -467,12 +494,23 @@ awaiting_initial_state(Evt, Msg, D) ->
                 [Evt, Msg, D]),
     close({unexpected, Msg}, D).
 
-awaiting_update_ack(enter, _OldSt, D) ->
-    {keep_state, D, [timer_for_state(awaiting_update_ack, D)]};
+awaiting_update_ack(enter, _OldSt, _D) -> keep_state_and_data;
 awaiting_update_ack(cast, {update_ack, Msg}, #data{} = D) ->
     case check_update_ack_msg(Msg, D) of
         {ok, D1} ->
-            {next_state, open, D1};
+            next_state(open, D1);
+        {error, _} = Error ->
+            close(Error, D)
+    end;
+awaiting_update_ack(cast, {update, _Msg}, D) ->
+    D1 = send_update_err_msg(fallback_to_stable_state(D)),
+    next_state(open, D1);
+awaiting_update_ack(cast, {update_err, Msg}, D) ->
+    lager:debug("received update_err: ~p", [Msg]),
+    case check_update_err_msg(Msg, D) of
+        {ok, D1} ->
+            report(conflict, Msg, D1),
+            next_state(open, D1);
         {error, _} = Error ->
             close(Error, D)
     end;
@@ -480,11 +518,10 @@ awaiting_update_ack(cast, {disconnect, _Msg}, D) ->
     close(disconnect, D);
 awaiting_update_ack(timeout, awaiting_update_ack = T, D) ->
     close({timeout, T}, D);
-awaiting_update_ack({call, _}, _Req, _D) ->
-    {keep_state_and_data, [postpone]}.
+awaiting_update_ack({call, _}, _Req, D) ->
+    postpone(D).
 
-signed(enter, _OldSt, D) ->
-    {keep_state, D, [timer_for_state(signed, D)]};
+signed(enter, _OldSt, _D) -> keep_state_and_data;
 signed(cast, {funding_locked, Msg}, D) ->
     case check_funding_locked_msg(Msg, D) of
         {ok, D1} ->
@@ -496,9 +533,9 @@ signed(cast, {funding_locked, Msg}, D) ->
 signed(timeout, signed = T, D) ->
     close({timeout, T}, D);
 signed(cast, {shutdown, _Msg}, D) ->
-    {next_state, closing, D};
+    next_state(closing, D);
 signed(cast, {disconnect, _Msg}, D) ->
-    {next_state, disconnected, D};
+    next_state(disconnected, D);
 signed({call, From}, Req, D) ->
     handle_call(signed, Req, From, D).
 
@@ -509,9 +546,9 @@ funding_locked_complete(D) ->
             {ok, OCTx} = initial_state(D),
             ok   = request_signing(update, OCTx, D),
             D1   = D#data{latest = {sign, update, OCTx}},
-            {next_state, awaiting_signature, D1};
+            next_state(awaiting_signature, D1);
         responder ->
-            {next_state, awaiting_initial_state, D}
+            next_state(awaiting_initial_state, D)
     end.
 
 
@@ -523,18 +560,28 @@ open(enter, _OldSt, D) ->
             true ->
                  D
          end,
-    {keep_state, D1, [timer_for_state(open, D)]};
+    keep_state(D1);
 open(cast, {update, Msg}, D) ->
     case check_update_msg(none, Msg, D) of
         {ok, SignedTx, D1} ->
             report(info, update, D1),
             ok = request_signing(update_ack, aetx_sign:tx(SignedTx), D1),
             D2 = D1#data{latest = {sign, update_ack, SignedTx}},
-            {next_state, awaiting_signature, D2};
+            next_state(awaiting_signature, D2);
         {error,_} = Error ->
             %% TODO: do we do a dispute challenge here?
             close(Error, D)
     end;
+open(cast, {inband_msg, Msg}, D) ->
+    NewD = case check_inband_msg(Msg, D) of
+               {ok, D1} ->
+                   report_info(true, msg, Msg, D1),
+                   D1;
+               {error, _} = Err ->
+                   lager:error("Error in inband_msg: ~p", [Err]),
+                   D
+           end,
+    keep_state(NewD);
 open({call, From}, Request, D) ->
     handle_call(open, Request, From, D);
 open(cast, {shutdown, Msg}, D) ->
@@ -542,17 +589,19 @@ open(cast, {shutdown, Msg}, D) ->
         {ok, SignedTx, D1} ->
             ok = request_signing(shutdown_ack, aetx_sign:tx(SignedTx), D1),
             D2 = D1#data{latest = {sign, shutdown_ack, SignedTx}},
-            {next_state, awaiting_signature, D2};
+            next_state(awaiting_signature, D2);
         {error, E} ->
             close({shutdown_error, E}, D)
     end;
 open(cast, {disconnect, _Msg}, D) ->
-    {next_state, disconnected, D};
+    next_state(disconnected, D);
+open(cast, _Msg, D) ->
+    lager:error("Discarding cast in 'open' state: ~p", [_Msg]),
+    keep_state(D);
 open(timeout, open = T, D) ->
     close({timeout, T}, D).
 
-closing(enter, _OldSt, D) ->
-    {keep_state, D, [timer_for_state(closing, D)]};
+closing(enter, _OldSt, _D) -> keep_state_and_data;
 closing(cast, {shutdown_ack, Msg}, D) ->
     case check_shutdown_ack_msg(Msg, D) of
         {ok, SignedTx, D1} ->
@@ -562,21 +611,26 @@ closing(cast, {shutdown_ack, Msg}, D) ->
             close(Error, D)
     end;
 closing(cast, {disconnect, _Msg}, D) ->
-    {next_state, disconnected, D};
+    next_state(disconnected, D);
 closing(cast, {closing_signed, _Msg}, D) ->
     close(closing_signed, D).
 
 disconnected(cast, {channel_reestablish, _Msg}, D) ->
-    {next_state, closing, D}.
+    next_state(closing, D).
 
 close(close_mutual, D) ->
     report(info, close_mutual, D),
+    close_session(D),
     {stop, normal, D};
 close(Reason, D) ->
     try send_error_msg(Reason, D)
     catch error:_ -> ignore
     end,
+    close_session(D),
     {stop, Reason, D}.
+
+close_session(#data{session = Sn}) when Sn =/= undefined ->
+    aesc_session_noise:close(Sn).
 
 send_error_msg(Reason, #data{session = Sn} = D) ->
     case cur_channel_id(D) of
@@ -605,8 +659,7 @@ handle_call_(open, {upd_transfer, FromPub, ToPub, Amount}, From,
         true ->
             handle_upd_transfer(FromPub, ToPub, Amount, From, D);
         false ->
-            {keep_state, D, [{reply, From, {error, invalid_pubkeys}},
-                             timer_for_state(open, D)]}
+            keep_state(D, [{reply, From, {error, invalid_pubkeys}}])
     end;
 handle_call_(open, shutdown, From, #data{state = State} = D) ->
     try  {_Round, Latest} = get_latest_state_tx(State),
@@ -614,18 +667,22 @@ handle_call_(open, shutdown, From, #data{state = State} = D) ->
          ok = request_signing(shutdown, CloseTx, D),
          gen_statem:reply(From, ok),
          D1 = D#data{latest = {sign, shutdown, CloseTx}},
-         {next_state, awaiting_signature, D1}
+         next_state(awaiting_signature, D1)
     catch
         error:E ->
-            {keep_state, D, [{reply, From, {error, E}},
-                             timer_for_state(open, D)]}
+            keep_state(D, [{reply, From, {error, E}}])
     end;
-handle_call_(St, _Req, _From, _D) when ?TRANSITION_STATE(St) ->
-    {keep_state_and_data, [postpone]};
-handle_call_(St, _Req, From, D) ->
-    {keep_state, D, [{reply, From, {error, unknown_request}},
-                     timer_for_state(St, D)]}.
-
+handle_call_(open, {inband_msg, ToPub, Msg}, From, #data{} = D) ->
+    case {ToPub, other_account(D)} of
+        {X, X} ->
+            keep_state(send_inband_msg(ToPub, Msg, D), [{reply, From, ok}]);
+        _ ->
+            keep_state(D, [{reply, From, {error, unknown_recipient}}])
+    end;
+handle_call_(St, _Req, _From, D) when ?TRANSITION_STATE(St) ->
+    postpone(D);
+handle_call_(_St, _Req, From, D) ->
+    keep_state(D, [{reply, From, {error, unknown_request}}]).
 
 cur_channel_id(#data{channel_id = TChId,
                      on_chain_id = PChId}) ->
@@ -852,6 +909,7 @@ send_update_msg(SignedTx, #data{ on_chain_id = OnChainId
                                , session     = Sn} = Data) ->
     TxBin = aetx_sign:serialize_to_binary(SignedTx),
     Msg = #{ channel_id => OnChainId
+           , slogan     => <<>>
            , data       => TxBin },
     aesc_session_noise:update(Sn, Msg),
     Data.
@@ -938,11 +996,10 @@ handle_upd_transfer(FromPub, ToPub, Amount, From, #data{ state = State
          ok = request_signing(update, Tx2, D),
          gen_statem:reply(From, ok),
          D1 = D#data{latest = {sign, update, Tx2}},
-         {next_state, awaiting_signature, D1}
+         next_state(awaiting_signature, D1)
     catch
         error:Reason ->
-            {keep_state, D, [{reply, From, {error, Reason}},
-                             timer_for_state(open, D)]}
+            keep_state(D, [{reply, From, {error, Reason}}])
     end.
 
 send_shutdown_msg(SignedTx, #data{session = Session} = Data) ->
@@ -1001,15 +1058,47 @@ check_shutdown_msg_(SignedTx, MySignedTx, D) ->
             {error, shutdown_tx_mismatch}
     end.
 
-get_latest_state_tx([SignedTx|T]) ->
+send_inband_msg(To, Msg, #data{on_chain_id = ChanId,
+                               session     = Session} = D) ->
+    From = my_account(D),
+    M = #{ channel_id => ChanId
+         , from       => From
+         , to         => To
+         , msg        => Msg },
+    aesc_session_noise:inband_msg(Session, M),
+    D.
+
+check_inband_msg(#{ channel_id := ChanId
+                  , from       := From
+                  , to         := To }, #data{on_chain_id = ChanId} = D) ->
+    case {my_account(D), other_account(D)} of
+        {To, From}     ->  {ok, D};
+        {To, _Other}   ->  {error, invalid_sender};
+        {_Other, From} ->  {error, invalid_recipient};
+        _ ->
+            {error, invalid_addresses}
+    end;
+check_inband_msg(_, _) ->
+    {error, chain_id_mismatch}.
+
+
+get_latest_state_tx(State) ->
+    [SignedTx|_] = drop_until_mutually_signed(State),
+    {tx_round(aetx_sign:tx(SignedTx)), SignedTx}.
+
+fallback_to_stable_state(#data{state = State} = D) ->
+    [_|_] = NewState = drop_until_mutually_signed(State),
+    D#data{state = NewState}.
+
+drop_until_mutually_signed([SignedTx|T] = State) ->
     case aetx_sign:signatures(SignedTx) of
         [_, _] ->
             %% mutually signed
-            {tx_round(aetx_sign:tx(SignedTx)), SignedTx};
+            State;
         _ ->
-            get_latest_state_tx(T)
+            drop_until_mutually_signed(T)
     end;
-get_latest_state_tx([]) ->
+drop_until_mutually_signed([]) ->
     error(no_latest_state).
 
 clean_state([]) ->
@@ -1149,8 +1238,33 @@ send_update_ack_msg(SignedTx, #data{ on_chain_id = OnChainId
     aesc_session_noise:update_ack(Sn, Msg),
     Data.
 
+send_update_err_msg(#data{ state = [SignedTx|_]
+                         , on_chain_id = ChanId
+                         , session     = Sn } = Data) ->
+    Round = tx_round(aec_tx_sign:tx(SignedTx)),
+    Msg = #{ channel_id => ChanId
+           , round      => Round },
+    aesc_session_noise:update_error(Sn, Msg),
+    report(conflict, Msg, Data),
+    Data.
 
-
+check_update_err_msg(#{ channel_id := ChanId
+                      , round      := Round },
+                     #data{on_chain_id = ChanId0,
+                           state = State} = D) ->
+    case ChanId == ChanId0 of
+        true ->
+            case get_latest_state_tx(State) of
+                {Round, State1} ->
+                    {ok, D#data{state = State1}};
+                _Other ->
+                    lager:debug("Fallback state mismatch: ~p/~p",
+                                [Round, _Other]),
+                    {error, fallback_state_mismatch}
+            end;
+        false ->
+            {error, chain_id_mismatch}
+    end.
 
 request_signing(Tag, Obj, #data{client    = Client,
                                 channel_id = ChanId}) ->
@@ -1213,7 +1327,8 @@ report_info(DoRpt, Tag, St, #data{client = Client, channel_id = ChanId}) ->
     lager:debug("report_info(~p, ~p, ~p, ~p)", [DoRpt, Tag, ChanId, St]),
     if DoRpt -> Client ! {?MODULE, self(), ChanId, {Tag, St}};
        true  -> ok
-    end.
+    end,
+    ok.
 
 do_rpt(Tag, #data{opts = #{report := Rpt}}) ->
     try maps:get(Tag, Rpt, false)
