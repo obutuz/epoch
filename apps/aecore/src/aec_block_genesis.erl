@@ -11,10 +11,6 @@
 %%%     block is very large - that may be considered abnormal for
 %%%     successive blocks (e.g. between blocks 1 and 2 - with block 0
 %%%     being genesis).
-%%% * It contains no transactions - not even coinbase;
-%%%   * This means that validation function attempting to check that
-%%%     there is at least a coinbase transaction in a block needs to
-%%%     have a special case for genesis.
 %%% * The hash values in it may have special values i.e. all zeros.
 %%%   * This means that validation function attempting to consider the
 %%%     hashes in a block needs to have a special case for genesis.
@@ -51,7 +47,9 @@ prev_hash() ->
     <<0:?BLOCK_HEADER_HASH_BYTES/unit:8>>.
 
 txs_hash() ->
-    <<0:?TXS_HASH_BYTES/unit:8>>.
+    <<0:?TXS_HASH_BYTES/unit:8>> =
+        aec_txs_trees:pad_empty(aec_txs_trees:root_hash(aec_txs_trees:from_txs(
+                                                          transactions()))).
 
 pow() ->
     no_value.
@@ -82,7 +80,8 @@ genesis_block_with_state(Map) ->
            txs = transactions(),
            pow_evidence = pow(),
            nonce = 0,
-           time = 0 %% Epoch.
+           time = 0, %% Epoch.
+           miner = <<0:?MINER_PUB_BYTES/unit:8>>
           },
     {Block, Trees}.
 

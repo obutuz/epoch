@@ -24,6 +24,8 @@
 -include_lib("apps/aecore/include/blocks.hrl").
 -include_lib("apps/aecontract/include/contract_txs.hrl").
 
+-define(MINER_PUBKEY, <<42:?MINER_PUB_BYTES/unit:8>>).
+
 %%%===================================================================
 %%% Common test framework
 %%%===================================================================
@@ -88,7 +90,7 @@ sign_and_apply_transaction(Tx, PrivKey, S1) ->
     SignedTx = aetx_sign:sign(Tx, PrivKey),
     Trees    = aect_test_utils:trees(S1),
     Height   = 1,
-    {ok, AcceptedTxs, Trees1} = aec_trees:apply_signed_txs([SignedTx], Trees, Height, ?PROTOCOL_VERSION),
+    {ok, AcceptedTxs, Trees1} = aec_trees:apply_signed_txs(?MINER_PUBKEY, [SignedTx], Trees, Height, ?PROTOCOL_VERSION),
     S2       = aect_test_utils:set_trees(Trees1, S1),
     {SignedTx, AcceptedTxs, S2}.
 
@@ -97,7 +99,7 @@ sign_and_apply_transaction_strict(Tx, PrivKey, S1) ->
     Trees    = aect_test_utils:trees(S1),
     Height   = 1,
     ConsensusVersion = aec_hard_forks:protocol_effective_at_height(Height),
-    {ok, AcceptedTxs, Trees1} = aec_trees:apply_signed_txs_strict([SignedTx], Trees, Height, ConsensusVersion),
+    {ok, AcceptedTxs, Trees1} = aec_trees:apply_signed_txs_strict(?MINER_PUBKEY, [SignedTx], Trees, Height, ConsensusVersion),
     S2       = aect_test_utils:set_trees(Trees1, S1),
     {SignedTx, AcceptedTxs, S2}.
 
