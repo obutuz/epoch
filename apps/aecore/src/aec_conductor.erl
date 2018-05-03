@@ -758,10 +758,9 @@ create_key_block_candidate(#state{keys_ready = false} = State) ->
 create_key_block_candidate(State) ->
     epoch_mining:info("Creating block candidate"),
     Fun = fun() ->
-                  {TopBlock, TopBlockState} = aec_chain:top_block_with_state(),
-                  AdjChain = get_adjustment_headers(TopBlock),
-                  {aec_mining:create_key_block_candidate(TopBlock, TopBlockState,
-                                                         AdjChain),
+                  {TopBlock, CurrentKeyBlock, TopBlockState} = aec_chain:get_top_and_key_with_state(),
+                  AdjChain = get_adjustment_headers(CurrentKeyBlock),
+                  {aec_mining:create_key_block_candidate(TopBlock, TopBlockState, AdjChain),
                    State#state.seen_top_block_hash}
           end,
     dispatch_worker(create_key_block_candidate, Fun, State).
@@ -806,8 +805,8 @@ create_micro_block_candidate(#state{keys_ready = false} = State) ->
 create_micro_block_candidate(State) ->
     epoch_mining:info("Creating block candidate"),
     Fun = fun() ->
-        {TopBlock, TopBlockState} = aec_chain:top_block_with_state(),
-        {aec_mining:create_micro_block_candidate(TopBlock, TopBlockState),
+        {TopBlock, CurrentKeyBlock, TopBlockState} = aec_chain:get_top_and_key_with_state(),
+        {aec_mining:create_micro_block_candidate(TopBlock, CurrentKeyBlock, TopBlockState),
             State#state.seen_top_block_hash}
     end,
     dispatch_worker(create_micro_block_candidate, Fun, State).

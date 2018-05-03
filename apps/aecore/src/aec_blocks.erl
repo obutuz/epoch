@@ -20,8 +20,10 @@
          key/1,
          set_key/2,
          set_target/2,
-         new/3,
-         new_with_state/3,
+         new_key/4,
+         new_micro/4,
+         new_key_with_state/4,
+         new_with_state/4,
          from_header_and_txs/2,
          to_header/1,
          serialize_to_binary/1,
@@ -100,6 +102,10 @@ key(Block) ->
 set_key(Block, Key) ->
     Block#block{key = Key}.
 
+-spec key_hash(block()) -> binary().
+key_hash(Block) ->
+    Block#block.key_hash.
+
 -spec signature(block()) -> binary().
 signature(Block) ->
     Block#block.signature.
@@ -117,36 +123,35 @@ txs(Block) ->
 txs_hash(Block) ->
     Block#block.txs_hash.
 
--spec new(block(), list(aetx_sign:signed_tx()), aec_trees:trees()) -> block().
-new(LastBlock, Txs, Trees0) ->
-    {B, _} = new_with_state(LastBlock, Txs, Trees0),
+-spec new_micro(block(), block(), list(aetx_sign:signed_tx()), aec_trees:trees()) -> block().
+new_micro(LastBlock, CurrentKeyBlock, Txs, Trees0) ->
+    {B, _} = new_with_state(LastBlock, CurrentKeyBlock, Txs, Trees0),
     B.
 
--spec new_with_state(block(), list(aetx_sign:signed_tx()), aec_trees:trees()) ->
-                                {block(), aec_trees:trees()}.
-new_with_state(LastBlock, Txs, Trees0) ->
-    LastBlockHeight = height(LastBlock),
+-spec new_key(block(), block(), list(aetx_sign:signed_tx()), aec_trees:trees()) -> block().
+new_key(LastBlock, CurrentKeyBlock, Txs, Trees0) ->
+    {B, _} = new_key_with_state(LastBlock, CurrentKeyBlock, Txs, Trees0),
+    B.
 
-    %% Assert correctness of last block protocol version, as minimum
-    %% sanity check on previous block and state (mainly for potential
-    %% stale state persisted in DB and for development testing).
-    ExpectedLastBlockVersion = protocol_effective_at_height(LastBlockHeight),
-    {ExpectedLastBlockVersion, _} = {LastBlock#block.version,
-                                     {expected, ExpectedLastBlockVersion}},
+-spec new_with_state(atom(), block(), list(aetx_sign:signed_tx()), aec_trees:trees()) ->
+                                {block(), aec_trees:trees()}.
+new_with_state(LastBlock, CurrentKeyBlock, Txs, Trees0) ->
+
     {ok, LastBlockHeaderHash} = hash_internal_representation(LastBlock),
 
-    Height = LastBlockHeight + 1,
-    Version = protocol_effective_at_height(Height),
+    LastBlockHeight = height(CurrentKeyBlock),
+    Version = protocol_effective_at_height(LastBlockHeight),
 
     %% We should not have any transactions with invalid signatures for
     %% creation of block candidate, as only txs with validated signatures should land in mempool.
     %% Let's hardcode this expectation for now.
     Txs = aetx_sign:filter_invalid_signatures(Txs),
 
-    {ok, Txs1, Trees} = aec_trees:apply_signed_txs(Txs, Trees0, Height, Version),
+    {ok, Txs1, Trees} = aec_trees:apply_signed_txs(Txs, Trees0, LastBlockHeight, Version),
     {ok, TxsRootHash} = aec_txs_trees:root_hash(aec_txs_trees:from_txs(Txs1)),
     NewBlock =
-        #block{height = Height,
+        #block{height = LastBlockHeight,
+               key_hash = key_hash(CurrentKeyBlock),
                prev_hash = LastBlockHeaderHash,
                root_hash = aec_trees:hash(Trees),
                txs_hash = TxsRootHash,
@@ -155,6 +160,22 @@ new_with_state(LastBlock, Txs, Trees0) ->
                time = aeu_time:now_in_msecs(),
                version = Version},
     {NewBlock, Trees}.
+
+new_key_with_state(LastBlock, CurrentKeyBlock, Txs, Trees0) ->
+
+    {UncompleteBlock, Trees} = new_with_state(LastBlock, CurrentKeyBlock, Txs, Trees0),
+
+    %% Assert correctness of last block protocol version, as minimum
+    %% sanity check on previous block and state (mainly for potential
+    %% stale state persisted in DB and for development testing).
+    ExpectedLastBlockVersion = protocol_effective_at_height(CurrentKeyBlock),
+    {ExpectedLastBlockVersion, _} = {LastBlock#block.version, {expected, ExpectedLastBlockVersion}},
+
+    LastBlockHeight = height(CurrentKeyBlock),
+    NewHeight = LastBlockHeight + 1,
+    Version = protocol_effective_at_height(NewHeight),
+
+    {UncompleteBlock#block{height = NewHeight, version = Version, key_hash = undefined}, Trees}.
 
 -spec to_header(block()) -> aec_headers:header().
 to_header(#block{height = Height,

@@ -537,7 +537,7 @@ db_node_has_sibling_blocks(Node) ->
 set_height(#node{type = micro, key_hash = KeyHash} = Node) ->
     Height = case aec_db:get_header(KeyHash) of
                 none -> error({key_hash_not_found, KeyHash});
-                {value, Header} -> aec_headers:height(Header)
+                Header -> aec_headers:height(Header)
             end,
     Node#node{height = Height};
 set_height(#node{height = Height} = Node) ->
