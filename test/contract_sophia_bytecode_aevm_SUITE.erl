@@ -16,7 +16,7 @@
    ]).
 
 %% chain API exports
--export([ spend/3, get_balance/2, call_contract/6 ]).
+-export([ spend/3, get_balance/2, call_contract/6, get_store/1, set_store/2 ]).
 
 -include("apps/aecontract/src/aecontract.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -231,7 +231,7 @@ initial_state(Contracts) ->
     initial_state(Contracts, #{}).
 
 initial_state(Contracts, Accounts) ->
-    maps:merge(#{environment => #{}},
+    maps:merge(#{environment => #{}, store => #{}},
         maps:merge(Contracts, #{accounts => Accounts})).
 
 spend(_To, Amount, _) when Amount < 0 ->
@@ -246,6 +246,21 @@ spend(To, Amount, S = #{ running := From, accounts := Accounts }) ->
 
 get_balance(Account, #{ accounts := Accounts }) ->
     maps:get(Account, Accounts, 0).
+
+get_store(#{ running := Contract, store := Store }) ->
+    Data = maps:get(Contract, Store, undefined),
+    case Data of
+        undefined ->
+            io:format("get_store() -> undefined\n"),
+            <<>>;
+        _ ->
+            io:format("get_store() -> ~p\n", [aeso_test_utils:dump_words(Data)]),
+            Data
+    end.
+
+set_store(Data, State = #{ running := Contract, store := Store }) ->
+    io:format("set_store() <- ~p\n", [aeso_test_utils:dump_words(Data)]),
+    State#{ store => Store#{ Contract => Data } }.
 
 -define(PRIM_CALL_SPEND, 1).
 
