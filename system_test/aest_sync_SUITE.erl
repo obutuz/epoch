@@ -42,14 +42,18 @@
     name    => old_node1,
     peers   => [old_node2],
     backend => aest_docker,
-    source  => {pull, "aeternity/epoch:v0.11.1"}
+    %% Change back when `latest` can be sync to
+    % source  => {pull, "aeternity/epoch:latest"}
+    source  => {pull, "aeternity/epoch:local"}
 }).
 
 -define(OLD_NODE2, #{
     name    => old_node2,
     peers   => [old_node1],
     backend => aest_docker,
-    source  => {pull, "aeternity/epoch:v0.11.1"}
+    %% Change back when `latest` can be sync to
+    % source  => {pull, "aeternity/epoch:latest"}
+    source  => {pull, "aeternity/epoch:local"}
 }).
 
 -define(NEW_NODE1, #{
