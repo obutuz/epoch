@@ -403,6 +403,10 @@ groups() ->
       % initiator can start close mutual
        sc_ws_open,
        sc_ws_update,
+       sc_ws_close,
+      % initiator can start close mutual
+       sc_ws_open,
+       sc_ws_update,
        sc_ws_close_mutual_inititator,
        % responder can start close mutual
        sc_ws_open,
@@ -444,11 +448,11 @@ init_per_group(channel_websocket, Config) ->
     %% prepare participants
     {IPubkey, IPrivkey} = generate_key_pair(),
     {RPubkey, RPrivkey} = generate_key_pair(),
-    IStartAmt = 20,
-    RStartAmt = 10,
+    IStartAmt = 40,
+    RStartAmt = 20,
     Fee = 1,
 
-    aecore_suite_utils:mine_blocks(aecore_suite_utils:node_name(?NODE), 4),
+    aecore_suite_utils:mine_blocks(aecore_suite_utils:node_name(?NODE), 7),
 
     {ok, 200, _} = post_spend_tx(IPubkey, IStartAmt, Fee),
     {ok, 200, _} = post_spend_tx(RPubkey, RStartAmt, Fee),
@@ -3014,6 +3018,10 @@ sc_ws_open(Config) ->
       responder := #{pub_key := RPubkey,
                     priv_key := RPrivkey}} = proplists:get_value(participants, Config),
 
+    {ok, 200, #{<<"balance">> := IStartAmt}} =
+                 get_balance_at_top(aec_base58c:encode(account_pubkey, IPubkey)),
+    {ok, 200, #{<<"balance">> := RStartAmt}} =
+                 get_balance_at_top(aec_base58c:encode(account_pubkey, RPubkey)),
     IAmt = 7,
     RAmt = 3,
 
@@ -3146,9 +3154,6 @@ sc_ws_update(Config) ->
             ct:log("Update tx ~p", [UpdateTx]),
             {ok, #{<<"event">> := <<"update">>}} = ?WS:wait_for_channel_event(ReceiverPid, info),
             UpdateTx = channel_sign_tx(ReceiverPid, ReceiverPrivkey, <<"update_ack">>),
-            %% consume wrong event message
-            {ok, #{<<"event">> := <<"open">>}} = ?WS:wait_for_channel_event(SenderPid, info),
-            {ok, #{<<"event">> := <<"open">>}} = ?WS:wait_for_channel_event(ReceiverPid, info),
             ok
         end,
     SendTokens(IConnPid, RConnPid, IPubkey, IPrivkey, RPubkey, RPrivkey, 2),
