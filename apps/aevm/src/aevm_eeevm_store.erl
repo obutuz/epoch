@@ -59,5 +59,5 @@ write_words([], _, Mem) -> Mem.
 to_list(Mem) -> to_list(0, lists:sort(maps:to_list(Mem))).
 
 to_list(_, [])              -> [];
-to_list(N, [{N, W} | Rest]) -> [W || to_list(N+32, Rest)];
-to_list(N, Rest)            -> [0 || to_list(N+32, Rest)].
+to_list(N, [{N, W} | Rest]) -> [W | to_list(N+32, Rest)];
+to_list(N, Rest)            -> [0 | to_list(N+32, Rest)].
