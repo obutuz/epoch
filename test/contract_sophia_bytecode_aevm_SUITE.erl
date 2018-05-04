@@ -261,16 +261,11 @@ get_balance(Account, #{ accounts := Accounts }) ->
 get_store(#{ running := Contract, store := Store }) ->
     Data = maps:get(Contract, Store, undefined),
     case Data of
-        undefined ->
-            io:format("get_store() -> undefined\n"),
-            <<>>;
-        _ ->
-            io:format("get_store() -> ~p\n", [aeso_test_utils:dump_words(Data)]),
-            Data
+        undefined -> <<>>;
+        _         -> Data
     end.
 
 set_store(Data, State = #{ running := Contract, store := Store }) ->
-    io:format("set_store() <- ~p\n", [aeso_test_utils:dump_words(Data)]),
     State#{ store => Store#{ Contract => Data } }.
 
 -define(PRIM_CALL_SPEND, 1).
