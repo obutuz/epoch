@@ -18,6 +18,7 @@
 %% chain API exports
 -export([ spend/3, get_balance/2, call_contract/6 ]).
 
+-include("apps/aecontract/src/aecontract.hrl").
 -include_lib("common_test/include/ct.hrl").
 
 all() -> [ execute_identity_fun_from_sophia_file,
@@ -61,7 +62,8 @@ execute_call(Contract, CallData, ChainState, Options) ->
              currentNumber     => 0,
              currentTimestamp  => 0,
              chainState        => ChainState1,
-             chainAPI          => ?MODULE}, Options),
+             chainAPI          => ?MODULE,
+             vm_version        => ?AEVM_01_Sophia_01}, Options),
           Trace),
     case Res of
         {ok, #{ out := RetVal, chain_state := S }} ->

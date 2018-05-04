@@ -81,6 +81,7 @@ execute_call(#{ code := CodeAsHexBinString
               , currentTimestamp := TS
               , chainState := ChainState
               , chainAPI := ChainAPI
+              , vm_version := VmVersion
               }, Trace) ->
     %% TODO: Handle Contract In State.
     Code = aeu_hex:hexstring_decode(CodeAsHexBinString),
@@ -101,6 +102,7 @@ execute_call(#{ code := CodeAsHexBinString
                    , currentTimestamp => TS
                    , chainState => ChainState
                    , chainAPI => ChainAPI
+                   , vm_version => VmVersion
                    },
            pre => #{}},
     TraceSpec =

@@ -90,7 +90,8 @@ call_AEVM_01_Sophia_01(#{ caller     := Caller
                       currentNumber     => Height,
                       currentTimestamp  => 0,
                       chainState        => ChainState,
-                      chainAPI          => aec_vm_chain},
+                      chainAPI          => aec_vm_chain,
+                      vm_version        => ?AEVM_01_Sophia_01},
              pre => #{}},
           #{
 	     trace_fun  => fun(S,A) -> lager:error(S,A) end,
